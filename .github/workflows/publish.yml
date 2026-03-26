@@ -20,7 +20,7 @@ jobs:
       test-command: 'npm test'     # default: 'npm test'
       build-command: 'npm run build' # default: 'npm run build'
       publish-enabled: true        # default: false
-      publish-auth-method: 'token' # default: token (or oidc)
+      publish-auth-method: 'oidc'  # default: token (or oidc)
       publish-tag: 'latest'        # default: 'latest'
       publish-provenance: true     # default: true
     secrets:
