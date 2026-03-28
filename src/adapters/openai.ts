@@ -1,4 +1,4 @@
-import type { ChatStreamEvent, StreamReaderOptions, TokenUsage } from '../types.js';
+import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readSSEStream } from '../stream-reader.js';
 
 /**
@@ -14,10 +14,17 @@ import { readSSEStream } from '../stream-reader.js';
  * (e.g. Azure OpenAI, Together AI, Groq, vLLM, LiteLLM).
  */
 export async function* openaiStream(
-  response: Response,
+  input: StreamInput,
   options?: StreamReaderOptions,
 ): AsyncGenerator<ChatStreamEvent> {
-  for await (const sse of readSSEStream(response, options)) {
+  // Accumulate usage across chunks and emit exactly one terminal `done`
+  // when the stream completes (avoids duplicate done events from a
+  // finish_reason chunk plus a trailing usage-only chunk).
+  let usage: TokenUsage | undefined;
+  let finishReason: string | undefined;
+  let lastPayload: unknown;
+
+  for await (const sse of readSSEStream(input, options)) {
     // Skip empty data or retry-only events
     if (!sse.data) continue;
 
@@ -28,6 +35,7 @@ export async function* openaiStream(
       yield { type: 'error', message: 'Invalid JSON in SSE data', code: 'parse_error' };
       continue;
     }
+    lastPayload = payload;
 
     // Error object from the API
     if (payload.error) {
@@ -36,40 +44,44 @@ export async function* openaiStream(
         type: 'error',
         message: String(err.message ?? 'Unknown OpenAI error'),
         code: err.code != null ? String(err.code) : undefined,
+        raw: payload,
       };
       continue;
     }
 
+    // Usage may arrive on any chunk (typically the final one when
+    // `stream_options: { include_usage: true }`).
+    if (payload.usage) {
+      usage = mapUsage(payload.usage);
+    }
+
     const choices = payload.choices as Array<Record<string, unknown>> | undefined;
     if (!choices || choices.length === 0) {
-      // Final chunk may carry only `usage`
-      if (payload.usage) {
-        yield { type: 'done', usage: mapUsage(payload.usage) };
-      }
       continue;
     }
 
     const choice = choices[0];
-    const delta = choice.delta as Record<string, unknown> | undefined;
+    if (typeof choice.finish_reason === 'string') {
+      finishReason = choice.finish_reason;
+    }
 
+    const delta = choice.delta as Record<string, unknown> | undefined;
     if (!delta) {
-      if (choice.finish_reason) {
-        yield { type: 'done', usage: payload.usage ? mapUsage(payload.usage) : undefined };
-      }
       continue;
     }
 
     // Text content
     if (typeof delta.content === 'string' && delta.content) {
-      yield { type: 'text', content: delta.content };
+      yield { type: 'text', content: delta.content, raw: payload };
     }
 
     // Reasoning / thinking content (OpenAI o-series, DeepSeek-R1, etc.)
     if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
-      yield { type: 'reasoning', content: delta.reasoning_content };
+      yield { type: 'reasoning', content: delta.reasoning_content, raw: payload };
     }
 
-    // Tool calls
+    // Tool calls — fragments are grouped by `index` so callers can
+    // reassemble parallel/streamed tool calls.
     const toolCalls = delta.tool_calls as Array<Record<string, unknown>> | undefined;
     if (toolCalls) {
       for (const tc of toolCalls) {
@@ -80,16 +92,15 @@ export async function* openaiStream(
             id: String(tc.id ?? ''),
             name: String(fn.name ?? ''),
             arguments: String(fn.arguments ?? ''),
+            index: typeof tc.index === 'number' ? tc.index : undefined,
+            raw: payload,
           };
         }
       }
     }
-
-    // Finish reason in this chunk
-    if (choice.finish_reason) {
-      yield { type: 'done', usage: payload.usage ? mapUsage(payload.usage) : undefined };
-    }
   }
+
+  yield { type: 'done', usage, finishReason, raw: lastPayload };
 }
 
 function mapUsage(raw: unknown): TokenUsage {

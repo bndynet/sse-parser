@@ -18,8 +18,10 @@ export class SSEParser {
 
   // Per-event buffers (reset after each dispatch)
   private dataBuffer = '';
+  private hasData = false;
   private eventType = '';
   private lastEventId = '';
+  private pendingRetry?: number;
 
   // Line accumulation
   private lineBuffer = '';
@@ -65,8 +67,10 @@ export class SSEParser {
    */
   reset(): void {
     this.dataBuffer = '';
+    this.hasData = false;
     this.eventType = '';
     this.lastEventId = '';
+    this.pendingRetry = undefined;
     this.lineBuffer = '';
     this.bomStripped = false;
     this.previousCharWasCR = false;
@@ -112,8 +116,10 @@ export class SSEParser {
   private processField(field: string, value: string): void {
     switch (field) {
       case 'data':
-        // Append to data buffer, then append a LF
-        this.dataBuffer += this.dataBuffer ? '\n' + value : value;
+        // Spec: append the value then a single LF after every data line.
+        // The final trailing LF is stripped at dispatch time.
+        this.dataBuffer += value + '\n';
+        this.hasData = true;
         break;
       case 'event':
         this.eventType = value;
@@ -127,14 +133,10 @@ export class SSEParser {
       case 'retry': {
         const parsed = /^\d+$/.test(value) ? Number(value) : NaN;
         if (!Number.isNaN(parsed)) {
-          // Notify via a synthetic event so the consumer can act on retry hints
-          const retryEvent: SSEEvent = {
-            event: '',
-            data: '',
-            id: this.lastEventId,
-            retry: parsed,
-          };
-          this.cb.onEvent(retryEvent);
+          // Record the reconnection-time hint; surfaced via `onRetry` and
+          // attached to the next dispatched event's `retry` field.
+          this.pendingRetry = parsed;
+          this.cb.onRetry?.(parsed);
         }
         break;
       }
@@ -145,12 +147,12 @@ export class SSEParser {
   }
 
   private dispatchEvent(): void {
-    // Nothing to dispatch
-    if (this.dataBuffer === '' && this.eventType === '') {
+    // Nothing to dispatch (no data lines and no explicit event type)
+    if (!this.hasData && this.eventType === '') {
       return;
     }
 
-    // Spec step 3: strip trailing LF from data buffer
+    // Spec step 3: strip the single trailing LF from the data buffer
     const data =
       this.dataBuffer.endsWith('\n')
         ? this.dataBuffer.slice(0, -1)
@@ -162,8 +164,14 @@ export class SSEParser {
       id: this.lastEventId,
     };
 
+    if (this.pendingRetry !== undefined) {
+      event.retry = this.pendingRetry;
+      this.pendingRetry = undefined;
+    }
+
     // Reset per-event buffers (lastEventId persists across events per spec)
     this.dataBuffer = '';
+    this.hasData = false;
     this.eventType = '';
 
     this.cb.onEvent(event);

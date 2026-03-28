@@ -1,4 +1,4 @@
-import type { ChatStreamEvent, StreamReaderOptions, TokenUsage } from '../types.js';
+import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readNDJSONStream } from '../stream-reader.js';
 
 /**
@@ -13,13 +13,13 @@ import { readNDJSONStream } from '../stream-reader.js';
  * which we map to a simplified {@link TokenUsage}.
  */
 export async function* ollamaStream(
-  response: Response,
+  input: StreamInput,
   options?: StreamReaderOptions,
 ): AsyncGenerator<ChatStreamEvent> {
-  for await (const obj of readNDJSONStream<Record<string, unknown>>(response, options)) {
+  for await (const obj of readNDJSONStream<Record<string, unknown>>(input, options)) {
     // Error field
     if (typeof obj.error === 'string' && obj.error) {
-      yield { type: 'error', message: obj.error };
+      yield { type: 'error', message: obj.error, raw: obj };
       continue;
     }
 
@@ -28,14 +28,14 @@ export async function* ollamaStream(
     if (msg) {
       // Text content
       if (typeof msg.content === 'string' && msg.content) {
-        yield { type: 'text', content: msg.content };
+        yield { type: 'text', content: msg.content, raw: obj };
       }
 
       // Some Ollama-compatible servers expose a `thinking` field
       if (typeof (msg as Record<string, unknown>).thinking === 'string') {
         const thinking = (msg as Record<string, unknown>).thinking as string;
         if (thinking) {
-          yield { type: 'reasoning', content: thinking };
+          yield { type: 'reasoning', content: thinking, raw: obj };
         }
       }
     }
@@ -45,6 +45,8 @@ export async function* ollamaStream(
       yield {
         type: 'done',
         usage: mapOllamaUsage(obj),
+        finishReason: typeof obj.done_reason === 'string' ? obj.done_reason : undefined,
+        raw: obj,
       };
       return;
     }

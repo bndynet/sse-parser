@@ -1,4 +1,4 @@
-import type { ChatStreamEvent, StreamReaderOptions, TokenUsage } from '../types.js';
+import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readSSEStream } from '../stream-reader.js';
 
 /**
@@ -17,13 +17,18 @@ import { readSSEStream } from '../stream-reader.js';
  *   event: ping                → keep-alive (ignored)
  */
 export async function* anthropicStream(
-  response: Response,
+  input: StreamInput,
   options?: StreamReaderOptions,
 ): AsyncGenerator<ChatStreamEvent> {
   // Anthropic does NOT use `data: [DONE]` — stream ends with `message_stop`
   const opts: StreamReaderOptions = { ...options, doneSentinel: null };
 
-  for await (const sse of readSSEStream(response, opts)) {
+  // Captured on `message_delta`; emitted with the single terminal `done`.
+  let usage: TokenUsage | undefined;
+  let finishReason: string | undefined;
+  let lastPayload: unknown;
+
+  for await (const sse of readSSEStream(input, opts)) {
     if (!sse.data) continue;
 
     let payload: Record<string, unknown>;
@@ -33,6 +38,11 @@ export async function* anthropicStream(
       yield { type: 'error', message: 'Invalid JSON in Anthropic SSE', code: 'parse_error' };
       continue;
     }
+    lastPayload = payload;
+
+    // Anthropic carries the content-block index on the event payload so
+    // streamed tool-call fragments can be grouped by caller.
+    const index = typeof payload.index === 'number' ? payload.index : undefined;
 
     switch (sse.event) {
       case 'content_block_delta': {
@@ -40,9 +50,9 @@ export async function* anthropicStream(
         if (!delta) break;
 
         if (delta.type === 'text_delta' && typeof delta.text === 'string') {
-          yield { type: 'text', content: delta.text };
+          yield { type: 'text', content: delta.text, raw: payload };
         } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
-          yield { type: 'reasoning', content: delta.thinking };
+          yield { type: 'reasoning', content: delta.thinking, raw: payload };
         } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
           // Tool use argument streaming — expose as tool_call with incremental args
           yield {
@@ -50,6 +60,8 @@ export async function* anthropicStream(
             id: '',
             name: '',
             arguments: delta.partial_json,
+            index,
+            raw: payload,
           };
         }
         break;
@@ -63,22 +75,27 @@ export async function* anthropicStream(
             id: String(block.id ?? ''),
             name: String(block.name ?? ''),
             arguments: '',
+            index,
+            raw: payload,
           };
         }
         break;
       }
 
       case 'message_delta': {
+        // Capture usage and stop_reason; the terminal `done` is emitted on
+        // `message_stop`.
+        const u = payload.usage as Record<string, unknown> | undefined;
+        if (u) usage = mapAnthropicUsage(u);
         const delta = payload.delta as Record<string, unknown> | undefined;
-        const usage = payload.usage as Record<string, unknown> | undefined;
-        if (delta?.stop_reason) {
-          yield { type: 'done', usage: usage ? mapAnthropicUsage(usage) : undefined };
+        if (typeof delta?.stop_reason === 'string') {
+          finishReason = delta.stop_reason;
         }
         break;
       }
 
       case 'message_stop':
-        yield { type: 'done' };
+        yield { type: 'done', usage, finishReason, raw: payload };
         return;
 
       case 'error': {
@@ -87,6 +104,7 @@ export async function* anthropicStream(
           type: 'error',
           message: String(err?.message ?? 'Unknown Anthropic error'),
           code: err?.type != null ? String(err.type) : undefined,
+          raw: payload,
         };
         break;
       }
@@ -101,6 +119,9 @@ export async function* anthropicStream(
         break;
     }
   }
+
+  // Stream closed without an explicit `message_stop` — still signal completion.
+  yield { type: 'done', usage, finishReason, raw: lastPayload };
 }
 
 function mapAnthropicUsage(u: Record<string, unknown>): TokenUsage {

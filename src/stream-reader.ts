@@ -1,4 +1,4 @@
-import type { SSEEvent, StreamReaderOptions } from './types.js';
+import type { SSEEvent, StreamInput, StreamReaderOptions } from './types.js';
 import { SSEParser } from './parser.js';
 import { NDJSONParser } from './ndjson-parser.js';
 import { SSEConnectionError, SSETimeoutError } from './errors.js';
@@ -34,31 +34,226 @@ function assertOkResponse(response: Response): void {
 }
 
 // ---------------------------------------------------------------------------
+// ChunkSource — a uniform pull interface over the supported input kinds
+// ---------------------------------------------------------------------------
+
+/** A single chunk of the stream; `value` is undefined once `done` is true. */
+interface ReadOutcome {
+  value: Uint8Array | string | undefined;
+  done: boolean;
+}
+
+/**
+ * Normalizes the three accepted input kinds (`Response`, `ReadableStream`,
+ * `AsyncIterable`) behind one pull-based interface so the read loop and the
+ * deadline/abort machinery don't have to special-case them.
+ */
+interface ChunkSource {
+  /** Pull the next chunk. */
+  next(): Promise<ReadOutcome>;
+  /** Proactively tear down the source (on timeout / abort / error). */
+  cancel(): void;
+  /** Release any held resources after normal iteration completes. */
+  release(): void;
+}
+
+function isReadableStream(x: unknown): x is ReadableStream<Uint8Array> {
+  return typeof (x as { getReader?: unknown } | null)?.getReader === 'function';
+}
+
+function isResponse(x: unknown): x is Response {
+  return (
+    typeof x === 'object' &&
+    x !== null &&
+    'body' in x &&
+    'status' in x &&
+    typeof (x as { status?: unknown }).status === 'number'
+  );
+}
+
+function isAsyncIterable(
+  x: unknown,
+): x is AsyncIterable<Uint8Array | string> {
+  return (
+    typeof (x as { [Symbol.asyncIterator]?: unknown } | null)?.[
+      Symbol.asyncIterator
+    ] === 'function'
+  );
+}
+
+/** Wrap a Web `ReadableStreamDefaultReader` as a {@link ChunkSource}. */
+function readerSource(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): ChunkSource {
+  return {
+    next: () => reader.read(),
+    cancel: () => {
+      // Release the underlying connection; ignore cancel rejections.
+      void reader.cancel().catch(() => {});
+    },
+    release: () => {
+      try {
+        reader.releaseLock();
+      } catch {
+        // A pending read (e.g. after cancel on timeout/abort) makes releaseLock
+        // throw — safe to ignore since the stream is already being torn down.
+      }
+    },
+  };
+}
+
+/** Wrap any `AsyncIterable` as a {@link ChunkSource}. */
+function asyncIterableSource(
+  iterable: AsyncIterable<Uint8Array | string>,
+): ChunkSource {
+  const iterator = iterable[Symbol.asyncIterator]();
+  // Best-effort early termination; ignore errors / absent `return`. Calling
+  // `return()` runs the source generator's `finally` (e.g. so an upstream
+  // HttpClient subscription is unsubscribed) — both on cancel and on early
+  // termination via `[DONE]`, where the source is never drained to completion.
+  const end = (): void => {
+    try {
+      void Promise.resolve(iterator.return?.()).catch(() => {});
+    } catch {
+      // ignore
+    }
+  };
+  return {
+    next: () =>
+      iterator.next().then((r) => ({ value: r.value, done: Boolean(r.done) })),
+    cancel: end,
+    release: end,
+  };
+}
+
+/**
+ * Resolve a {@link StreamInput} into a {@link ChunkSource}.
+ *
+ * For a `Response`, the HTTP status is validated first (non-2xx throws
+ * `SSEConnectionError`); raw `ReadableStream`/`AsyncIterable` inputs skip that
+ * check since they carry no transport metadata.
+ */
+function toChunkSource(input: StreamInput): ChunkSource {
+  // ReadableStream first: a Response is NOT a ReadableStream (no getReader),
+  // and a ReadableStream is also async-iterable in modern runtimes, so it must
+  // be matched before the AsyncIterable branch.
+  if (isReadableStream(input)) {
+    return readerSource(input.getReader());
+  }
+  if (isResponse(input)) {
+    assertOkResponse(input);
+    return readerSource(input.body!.getReader());
+  }
+  if (isAsyncIterable(input)) {
+    return asyncIterableSource(input);
+  }
+  throw new SSEConnectionError(
+    'Unsupported stream input: expected a Response, ReadableStream, or AsyncIterable',
+  );
+}
+
+/**
+ * Pull the next chunk, racing `source.next()` against an idle-timeout timer
+ * and an external `AbortSignal`.
+ *
+ * Unlike a top-of-loop check, this guarantees the timeout and abort take
+ * effect even while the underlying read is blocked waiting for data (e.g. a
+ * hung server that never sends another byte). When either fires we proactively
+ * cancel the source to tear down the underlying connection.
+ */
+function readWithDeadline(
+  source: ChunkSource,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): Promise<ReadOutcome> {
+  if (signal?.aborted) {
+    source.cancel();
+    return Promise.reject(new SSEConnectionError('Stream aborted by caller'));
+  }
+
+  // Fast path: nothing to race against.
+  if (timeoutMs <= 0 && !signal) {
+    return source.next();
+  }
+
+  return new Promise<ReadOutcome>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const cleanup = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      source.cancel();
+      reject(err);
+    };
+
+    function onAbort(): void {
+      fail(new SSEConnectionError('Stream aborted by caller'));
+    }
+
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => fail(new SSETimeoutError(timeoutMs)), timeoutMs);
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    source.next().then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
+/** Turn a raw chunk into text; pass strings through, decode bytes. */
+function decodeChunk(
+  decoder: TextDecoder,
+  value: Uint8Array | string,
+): string {
+  return typeof value === 'string' ? value : decoder.decode(value, { stream: true });
+}
+
+// ---------------------------------------------------------------------------
 // readSSEStream
 // ---------------------------------------------------------------------------
 
 /**
- * Consume a `fetch` Response whose body is an SSE text/event-stream and
- * yield parsed {@link SSEEvent} objects.
+ * Consume an SSE (`text/event-stream`) source and yield parsed
+ * {@link SSEEvent} objects.
+ *
+ * Accepts a `fetch` {@link Response}, a raw `ReadableStream<Uint8Array>`, or
+ * any `AsyncIterable` of byte/text chunks (see {@link StreamInput}).
  *
  * The generator terminates when:
  *   1. A `data` field equals the configured `doneSentinel` (default `[DONE]`).
- *   2. The underlying ReadableStream signals `done`.
+ *   2. The underlying source signals `done`.
  *   3. The idle timeout expires.
  *   4. The caller's `AbortSignal` fires.
  */
 export async function* readSSEStream(
-  response: Response,
+  input: StreamInput,
   options?: StreamReaderOptions,
 ): AsyncGenerator<SSEEvent> {
-  assertOkResponse(response);
-
   const { timeoutMs, signal, doneSentinel } = resolveOptions(options);
-  const reader = response.body!.getReader();
+  const source = toChunkSource(input);
   const decoder = new TextDecoder();
 
   // Queue for events produced by the push parser
-  let eventQueue: SSEEvent[] = [];
+  const eventQueue: SSEEvent[] = [];
   let done = false;
 
   const parser = new SSEParser({
@@ -67,26 +262,12 @@ export async function* readSSEStream(
     },
   });
 
-  let lastActivity = Date.now();
-
   try {
     while (!done) {
-      // Abort check
-      if (signal?.aborted) {
-        throw new SSEConnectionError('Stream aborted by caller');
-      }
+      const result = await readWithDeadline(source, timeoutMs, signal);
 
-      // Timeout check
-      if (timeoutMs > 0 && Date.now() - lastActivity > timeoutMs) {
-        throw new SSETimeoutError(timeoutMs);
-      }
-
-      const result = await reader.read();
-
-      if (result.value) {
-        lastActivity = Date.now();
-        const text = decoder.decode(result.value, { stream: true });
-        parser.feed(text);
+      if (result.value !== undefined) {
+        parser.feed(decodeChunk(decoder, result.value));
       }
 
       // Yield all queued events
@@ -124,7 +305,7 @@ export async function* readSSEStream(
       err instanceof Error ? err.message : String(err),
     );
   } finally {
-    reader.releaseLock();
+    source.release();
   }
 }
 
@@ -133,20 +314,20 @@ export async function* readSSEStream(
 // ---------------------------------------------------------------------------
 
 /**
- * Consume a `fetch` Response whose body is newline-delimited JSON and
- * yield each parsed object.
+ * Consume a newline-delimited JSON source and yield each parsed object.
+ *
+ * Accepts a `fetch` {@link Response}, a raw `ReadableStream<Uint8Array>`, or
+ * any `AsyncIterable` of byte/text chunks (see {@link StreamInput}).
  */
 export async function* readNDJSONStream<T = unknown>(
-  response: Response,
+  input: StreamInput,
   options?: StreamReaderOptions,
 ): AsyncGenerator<T> {
-  assertOkResponse(response);
-
   const { timeoutMs, signal } = resolveOptions(options);
-  const reader = response.body!.getReader();
+  const source = toChunkSource(input);
   const decoder = new TextDecoder();
 
-  let valueQueue: T[] = [];
+  const valueQueue: T[] = [];
 
   const parser = new NDJSONParser<T>({
     onValue(value) {
@@ -154,23 +335,12 @@ export async function* readNDJSONStream<T = unknown>(
     },
   });
 
-  let lastActivity = Date.now();
-
   try {
     while (true) {
-      if (signal?.aborted) {
-        throw new SSEConnectionError('Stream aborted by caller');
-      }
-      if (timeoutMs > 0 && Date.now() - lastActivity > timeoutMs) {
-        throw new SSETimeoutError(timeoutMs);
-      }
+      const result = await readWithDeadline(source, timeoutMs, signal);
 
-      const result = await reader.read();
-
-      if (result.value) {
-        lastActivity = Date.now();
-        const text = decoder.decode(result.value, { stream: true });
-        parser.feed(text);
+      if (result.value !== undefined) {
+        parser.feed(decodeChunk(decoder, result.value));
       }
 
       while (valueQueue.length > 0) {
@@ -196,6 +366,6 @@ export async function* readNDJSONStream<T = unknown>(
       err instanceof Error ? err.message : String(err),
     );
   } finally {
-    reader.releaseLock();
+    source.release();
   }
 }

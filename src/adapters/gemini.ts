@@ -1,4 +1,4 @@
-import type { ChatStreamEvent, StreamReaderOptions, TokenUsage } from '../types.js';
+import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readSSEStream } from '../stream-reader.js';
 
 /**
@@ -13,13 +13,20 @@ import { readSSEStream } from '../stream-reader.js';
  * A `finishReason` on the candidate signals logical completion.
  */
 export async function* geminiStream(
-  response: Response,
+  input: StreamInput,
   options?: StreamReaderOptions,
 ): AsyncGenerator<ChatStreamEvent> {
   // Gemini has no `[DONE]` sentinel
   const opts: StreamReaderOptions = { ...options, doneSentinel: null };
 
-  for await (const sse of readSSEStream(response, opts)) {
+  // Accumulate usage and emit a single terminal `done` at stream end.
+  let usage: TokenUsage | undefined;
+  let finishReason: string | undefined;
+  let lastPayload: unknown;
+  // Monotonic index so each function call can be told apart by callers.
+  let toolIndex = 0;
+
+  for await (const sse of readSSEStream(input, opts)) {
     if (!sse.data) continue;
 
     let payload: Record<string, unknown>;
@@ -29,6 +36,7 @@ export async function* geminiStream(
       yield { type: 'error', message: 'Invalid JSON in Gemini SSE', code: 'parse_error' };
       continue;
     }
+    lastPayload = payload;
 
     // API-level error
     if (payload.error) {
@@ -37,29 +45,37 @@ export async function* geminiStream(
         type: 'error',
         message: String(err.message ?? 'Unknown Gemini error'),
         code: err.code != null ? String(err.code) : undefined,
+        raw: payload,
       };
       continue;
     }
 
+    if (payload.usageMetadata) {
+      usage = mapGeminiUsage(payload.usageMetadata);
+    }
+
     const candidates = payload.candidates as Array<Record<string, unknown>> | undefined;
     if (!candidates || candidates.length === 0) {
-      // Possible usage-only final chunk
-      if (payload.usageMetadata) {
-        yield { type: 'done', usage: mapGeminiUsage(payload.usageMetadata) };
-      }
       continue;
     }
 
     const candidate = candidates[0];
+    if (
+      typeof candidate.finishReason === 'string' &&
+      candidate.finishReason !== 'FINISH_REASON_UNSPECIFIED'
+    ) {
+      finishReason = candidate.finishReason;
+    }
+
     const content = candidate.content as Record<string, unknown> | undefined;
     const parts = content?.parts as Array<Record<string, unknown>> | undefined;
 
     if (parts) {
       for (const part of parts) {
         if (typeof part.text === 'string' && part.text) {
-          yield { type: 'text', content: part.text };
+          yield { type: 'text', content: part.text, raw: payload };
         }
-        // Gemini function-call parts
+        // Gemini function-call parts (delivered whole, not fragmented)
         if (part.functionCall) {
           const fc = part.functionCall as Record<string, unknown>;
           yield {
@@ -67,19 +83,15 @@ export async function* geminiStream(
             id: '',
             name: String(fc.name ?? ''),
             arguments: fc.args != null ? JSON.stringify(fc.args) : '',
+            index: toolIndex++,
+            raw: payload,
           };
         }
       }
     }
-
-    // Finish reason
-    if (candidate.finishReason && candidate.finishReason !== 'FINISH_REASON_UNSPECIFIED') {
-      yield {
-        type: 'done',
-        usage: payload.usageMetadata ? mapGeminiUsage(payload.usageMetadata) : undefined,
-      };
-    }
   }
+
+  yield { type: 'done', usage, finishReason, raw: lastPayload };
 }
 
 function mapGeminiUsage(raw: unknown): TokenUsage {
