@@ -1,5 +1,6 @@
 import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readSSEStream } from '../stream-reader.js';
+import { addNumber, asRecord, numberField } from './usage.js';
 
 /**
  * OpenAI Responses API streaming adapter (`POST /v1/responses` with `stream: true`).
@@ -136,10 +137,23 @@ export async function* openaiResponsesStream(
 }
 
 function mapResponsesUsage(raw: unknown): TokenUsage {
-  const u = raw as Record<string, unknown>;
-  return {
-    promptTokens: typeof u.input_tokens === 'number' ? u.input_tokens : undefined,
-    completionTokens: typeof u.output_tokens === 'number' ? u.output_tokens : undefined,
-    totalTokens: typeof u.total_tokens === 'number' ? u.total_tokens : undefined,
+  const u = asRecord(raw);
+  const inputDetails = asRecord(u?.input_tokens_details);
+  const outputDetails = asRecord(u?.output_tokens_details);
+  const promptTokens = numberField(u, 'input_tokens');
+  const cachedPromptTokens = numberField(inputDetails, 'cached_tokens');
+
+  const usage: TokenUsage = {
+    promptTokens,
+    completionTokens: numberField(u, 'output_tokens'),
+    totalTokens: numberField(u, 'total_tokens'),
   };
+
+  addNumber(usage, 'cachedPromptTokens', cachedPromptTokens);
+  if (promptTokens !== undefined && cachedPromptTokens !== undefined) {
+    usage.uncachedPromptTokens = promptTokens - cachedPromptTokens;
+  }
+  addNumber(usage, 'reasoningTokens', numberField(outputDetails, 'reasoning_tokens'));
+
+  return usage;
 }

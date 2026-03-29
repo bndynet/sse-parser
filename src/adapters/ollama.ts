@@ -1,5 +1,6 @@
 import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readNDJSONStream } from '../stream-reader.js';
+import { numberField } from './usage.js';
 
 /**
  * Ollama `/api/chat` streaming adapter.
@@ -54,8 +55,8 @@ export async function* ollamaStream(
 }
 
 function mapOllamaUsage(obj: Record<string, unknown>): TokenUsage | undefined {
-  const prompt = obj.prompt_eval_count;
-  const completion = obj.eval_count;
+  const prompt = numberField(obj, 'prompt_eval_count');
+  const completion = numberField(obj, 'eval_count');
   if (typeof prompt !== 'number' && typeof completion !== 'number') {
     return undefined;
   }

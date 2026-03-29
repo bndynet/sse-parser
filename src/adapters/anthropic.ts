@@ -1,5 +1,6 @@
 import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readSSEStream } from '../stream-reader.js';
+import { addNumber, numberField } from './usage.js';
 
 /**
  * Anthropic Messages streaming adapter.
@@ -125,8 +126,26 @@ export async function* anthropicStream(
 }
 
 function mapAnthropicUsage(u: Record<string, unknown>): TokenUsage {
-  return {
-    promptTokens: typeof u.input_tokens === 'number' ? u.input_tokens : undefined,
-    completionTokens: typeof u.output_tokens === 'number' ? u.output_tokens : undefined,
+  const uncachedPromptTokens = numberField(u, 'input_tokens');
+  const cachedPromptTokens = numberField(u, 'cache_read_input_tokens');
+  const cacheCreationPromptTokens = numberField(u, 'cache_creation_input_tokens');
+  const promptTokens =
+    uncachedPromptTokens !== undefined ||
+    cachedPromptTokens !== undefined ||
+    cacheCreationPromptTokens !== undefined
+      ? (uncachedPromptTokens ?? 0) +
+        (cachedPromptTokens ?? 0) +
+        (cacheCreationPromptTokens ?? 0)
+      : undefined;
+
+  const usage: TokenUsage = {
+    promptTokens,
+    completionTokens: numberField(u, 'output_tokens'),
   };
+
+  addNumber(usage, 'uncachedPromptTokens', uncachedPromptTokens);
+  addNumber(usage, 'cachedPromptTokens', cachedPromptTokens);
+  addNumber(usage, 'cacheCreationPromptTokens', cacheCreationPromptTokens);
+
+  return usage;
 }

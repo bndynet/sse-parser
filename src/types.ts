@@ -88,6 +88,16 @@ export interface TokenUsage {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  /** Prompt/input tokens served from a provider-side cache. */
+  cachedPromptTokens?: number;
+  /** Prompt/input tokens not served from a provider-side cache. */
+  uncachedPromptTokens?: number;
+  /** Prompt/input tokens written into a provider-side cache. */
+  cacheCreationPromptTokens?: number;
+  /** Completion/output tokens spent on hidden reasoning/thinking. */
+  reasoningTokens?: number;
+  /** Prompt/input tokens used for tool-use scaffolding. */
+  toolUsePromptTokens?: number;
 }
 
 export type ChatStreamEvent =

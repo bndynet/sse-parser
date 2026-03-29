@@ -1,5 +1,6 @@
 import type { ChatStreamEvent, StreamInput, StreamReaderOptions, TokenUsage } from '../types.js';
 import { readSSEStream } from '../stream-reader.js';
+import { addNumber, asRecord, numberField } from './usage.js';
 
 /**
  * Google Gemini streaming adapter.
@@ -95,10 +96,16 @@ export async function* geminiStream(
 }
 
 function mapGeminiUsage(raw: unknown): TokenUsage {
-  const u = raw as Record<string, unknown>;
-  return {
-    promptTokens: typeof u.promptTokenCount === 'number' ? u.promptTokenCount : undefined,
-    completionTokens: typeof u.candidatesTokenCount === 'number' ? u.candidatesTokenCount : undefined,
-    totalTokens: typeof u.totalTokenCount === 'number' ? u.totalTokenCount : undefined,
+  const u = asRecord(raw);
+  const usage: TokenUsage = {
+    promptTokens: numberField(u, 'promptTokenCount'),
+    completionTokens: numberField(u, 'candidatesTokenCount'),
+    totalTokens: numberField(u, 'totalTokenCount'),
   };
+
+  addNumber(usage, 'cachedPromptTokens', numberField(u, 'cachedContentTokenCount'));
+  addNumber(usage, 'toolUsePromptTokens', numberField(u, 'toolUsePromptTokenCount'));
+  addNumber(usage, 'reasoningTokens', numberField(u, 'thoughtsTokenCount'));
+
+  return usage;
 }

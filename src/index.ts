@@ -8,6 +8,7 @@ export { readSSEStream, readNDJSONStream } from './stream-reader.js';
 // Layer 3 — AI vendor adapters
 export { openaiStream } from './adapters/openai.js';
 export { openaiResponsesStream } from './adapters/openai-responses.js';
+export { deepseekStream } from './adapters/deepseek.js';
 export { anthropicStream } from './adapters/anthropic.js';
 export { geminiStream } from './adapters/gemini.js';
 export { ollamaStream } from './adapters/ollama.js';

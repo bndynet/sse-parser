@@ -1,6 +1,7 @@
 import type { ChatStreamEvent, StreamInput, StreamReaderOptions } from './types.js';
 import { openaiStream } from './adapters/openai.js';
 import { openaiResponsesStream } from './adapters/openai-responses.js';
+import { deepseekStream } from './adapters/deepseek.js';
 import { anthropicStream } from './adapters/anthropic.js';
 import { geminiStream } from './adapters/gemini.js';
 import { ollamaStream } from './adapters/ollama.js';
@@ -9,6 +10,7 @@ import { ollamaStream } from './adapters/ollama.js';
 export type ChatProvider =
   | 'openai'
   | 'openai-responses'
+  | 'deepseek'
   | 'anthropic'
   | 'gemini'
   | 'ollama';
@@ -44,6 +46,8 @@ export function chatStream(
       return openaiStream(input, options);
     case 'openai-responses':
       return openaiResponsesStream(input, options);
+    case 'deepseek':
+      return deepseekStream(input, options);
     case 'anthropic':
       return anthropicStream(input, options);
     case 'gemini':
